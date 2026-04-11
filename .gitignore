@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Project-specific exclusions
+collections/
+schemas/
+testing/
+tts_collections/
+uploads/
+sample_data/
+node_modules/
+dist/
+build/
+original files/
+*.log
+.DS_Store
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
