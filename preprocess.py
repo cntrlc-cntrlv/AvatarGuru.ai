@@ -72,8 +72,11 @@ PREPROCESS_LESSON = os.getenv("PREPROCESS_LESSON", "")
 PREPROCESS_TITLE = os.getenv("PREPROCESS_TITLE", "")
 PREPROCESS_START_PAGE = int(os.getenv("PREPROCESS_START_PAGE", "1"))
 PREPROCESS_END_PAGE = int(os.getenv("PREPROCESS_END_PAGE", "20"))
-# PREPROCESS_COLLECTION_NAME = os.getenv("PREPROCESS_COLLECTION_NAME", "")
-PREPROCESS_COLLECTION_NAME = os.path.splitext(os.path.basename(PREPROCESS_TITLE))[0].lower().replace(" ", "_")
+
+# Collection name = <pdf_filename_stem>_<start_page>_<end_page>
+# e.g. Hist.pdf + pages 12-15  →  hist_12_15
+_pdf_stem = os.path.splitext(os.path.basename(PREPROCESS_PDF_PATH))[0].lower().replace(" ", "_")
+PREPROCESS_COLLECTION_NAME = f"{_pdf_stem}_{PREPROCESS_START_PAGE}_{PREPROCESS_END_PAGE}"
 
 # Validate required config
 if not PREPROCESS_PDF_PATH or not os.path.exists(PREPROCESS_PDF_PATH):

@@ -12,7 +12,7 @@ import traceback
 from datetime import datetime
 
 import requests
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.llms.base import LLM
@@ -85,6 +85,37 @@ def _build_rag_chain(retriever):
     )
 
 
+def _resolve_collection_name(file_name: str) -> str:
+    """
+    Look up the Qdrant collection name from MongoDB (stored at ingest/preprocess time).
+    1. Checks 'files' collection by originalName (user uploads).
+    2. Checks 'lesson_contents' by title (preprocessed lessons).
+    3. Falls back to deriving from the filename as a last resort.
+    """
+    try:
+        # --- 1. User-uploaded files ---
+        files_col = current_app.config.get("FILES_COLLECTION")
+        if files_col is not None:
+            doc = files_col.find_one({"originalName": file_name}, {"qdrantCollection": 1})
+            if doc and doc.get("qdrantCollection"):
+                return doc["qdrantCollection"]
+
+        # --- 2. Preprocessed lessons (stored by preprocess.py) ---
+        mongo_client = current_app.config.get("MONGO_CLIENT")
+        if mongo_client is not None:
+            _db = mongo_client[os.getenv("MONGO_DB")]
+            lc_doc = _db["lesson_contents"].find_one({"title": file_name}, {"qdrantCollection": 1})
+            if lc_doc and lc_doc.get("qdrantCollection"):
+                return lc_doc["qdrantCollection"]
+
+    except Exception as e:
+        print(f"[QA] Collection name DB lookup failed: {e}")
+
+    # --- 3. Last resort: derive from the filename ---
+    print(f"[QA] Falling back to derived collection name for: '{file_name}'")
+    return filename_to_collection_name(file_name)
+
+
 # =============================================================================
 # /api/qa  — Text-based RAG question answering
 # =============================================================================
@@ -100,7 +131,8 @@ def ask_question():
     if not file_name:
         return jsonify({'error': 'No file name provided for context'}), 400
 
-    collection_name = filename_to_collection_name(file_name)
+    collection_name = _resolve_collection_name(file_name)
+    print(f"[QA] Using Qdrant collection: '{collection_name}' for file: '{file_name}'")
 
     try:
         retriever = get_relevant_docs(query, collection_name)
@@ -179,7 +211,8 @@ def qa_voice():
         effective_query = translated_text if translated_text else transcript
 
         # --- 4. Retrieval-Augmented QA ---
-        collection_name = filename_to_collection_name(file_name_ctx)
+        collection_name = _resolve_collection_name(file_name_ctx)
+        print(f"[QA-VOICE] Using Qdrant collection: '{collection_name}' for file: '{file_name_ctx}'")
         retriever = get_relevant_docs(effective_query, collection_name)
         qa = _build_rag_chain(retriever)
         qa_resp = qa.invoke({"query": effective_query})

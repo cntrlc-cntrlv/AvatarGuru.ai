@@ -1434,7 +1434,7 @@ export function StudyPage() {
 
         setBatchesLoading(true);
         try {
-          const data = await apiService.getBatches();
+          const data = await apiService.getBatches(fileId);
           console.log(`📦 Fetched ${data.totalBatches} batches from API`);
           setBatches(data.batches);
           setBatchFileName(data.fileName);
@@ -1547,19 +1547,19 @@ export function StudyPage() {
 
     // Update bot message when file selection changes
     useEffect(() => {
-      if (selectedFile) {
+      if (batchFileName) {
         setChatMessages((prev) => {
           const updated = [...prev];
           if (updated.length > 0 && updated[0].type === "bot") {
             updated[0] = {
               ...updated[0],
-              content: `Heyy any doubts about ${selectedFile}?`,
+              content: `Heyy any doubts about ${batchFileName}?`,
             };
           }
           return updated;
         });
       }
-    }, [selectedFile]);
+    }, [batchFileName]);
 
     // Auto-scroll to bottom when new messages are added
     useEffect(() => {
@@ -1641,7 +1641,7 @@ export function StudyPage() {
         const formData = new FormData();
         formData.append("audio", audioBlob);
         // Use the selected file for Q&A context
-        const fileName = selectedFile || "keph101.pdf";
+        const fileName = batchFileName || fileId || "keph101.pdf";
         formData.append("fileName", fileName);
 
         const response = await fetch(
@@ -1731,7 +1731,7 @@ export function StudyPage() {
             },
             body: JSON.stringify({
               question: userMessage,
-              fileName: selectedFile || "keph101.pdf",
+              fileName: batchFileName || fileId || "keph101.pdf",
             }),
           },
         );
@@ -1854,7 +1854,7 @@ export function StudyPage() {
                 <div className="flex-[0_0_60%] min-h-[300px] avatr-panel">
                   <AvatarCanvas
                     audioUrl={avatarAudioUrl ?? undefined}
-                    fileName={selectedFile || availableFiles[0]}
+                    fileName={batchFileName || fileId}
                   />
                 </div>
 
@@ -1989,7 +1989,7 @@ export function StudyPage() {
                                   "avatarguru_batches_timestamp",
                                 );
 
-                                const data = await apiService.getBatches();
+                                const data = await apiService.getBatches(fileId);
                                 console.log(
                                   `🔄 Refreshed ${data.totalBatches} batches`,
                                 );
@@ -2246,82 +2246,9 @@ export function StudyPage() {
                         <label className="text-sm font-medium text-gray-700 whitespace-nowrap">
                           Ask about:
                         </label>
-                        <select
-                          value={selectedFile}
-                          onChange={(e) => setSelectedFile(e.target.value)}
-                          disabled={filesLoading}
-                          className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50"
-                        >
-                          {filesLoading ? (
-                            <option>Loading files...</option>
-                          ) : availableFiles.length > 0 ? (
-                            availableFiles.map((file) => (
-                              <option key={file} value={file}>
-                                {file}
-                              </option>
-                            ))
-                          ) : (
-                            <option>No files available</option>
-                          )}
-                        </select>
-                        <button
-                          onClick={async () => {
-                            setFilesLoading(true);
-                            try {
-                              // Clear cache and force fresh fetch
-                              localStorage.removeItem(
-                                "avatarguru_available_files",
-                              );
-                              localStorage.removeItem(
-                                "avatarguru_files_timestamp",
-                              );
-
-                              const response = await fetch(
-                                `${import.meta.env.VITE_API_BASE_URL || "http://localhost:5000"}/api/files`,
-                              );
-                              if (response.ok) {
-                                const fileList = await response.json();
-                                setAvailableFiles(fileList);
-                                // Update selected file if current one is no longer available
-                                if (
-                                  fileList.length > 0 &&
-                                  !fileList.includes(selectedFile)
-                                ) {
-                                  setSelectedFile(fileList[0]);
-                                }
-
-                                // Cache the new files
-                                const now = Date.now();
-                                localStorage.setItem(
-                                  "avatarguru_available_files",
-                                  JSON.stringify(fileList),
-                                );
-                                localStorage.setItem(
-                                  "avatarguru_files_timestamp",
-                                  now.toString(),
-                                );
-                                console.log(
-                                  "💾 Cached refreshed available files",
-                                );
-                              }
-                            } catch (error) {
-                              console.error("Error refreshing files:", error);
-                            } finally {
-                              setFilesLoading(false);
-                            }
-                          }}
-                          disabled={filesLoading}
-                          className="text-xs px-2 py-1 bg-indigo-100 text-indigo-700 rounded hover:bg-indigo-200 transition-colors disabled:opacity-50"
-                          title="Refresh file list"
-                        >
-                          🔄
-                        </button>
-                        {selectedFile && (
-                          <div className="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded">
-                            {availableFiles.indexOf(selectedFile) + 1} of{" "}
-                            {availableFiles.length}
-                          </div>
-                        )}
+                        <span className="flex-1 px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm text-gray-700 font-semibold truncate">
+                          {batchFileName || fileId || "Loading..."}
+                        </span>
                       </div>
                     </div>
                   </div>

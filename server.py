@@ -87,6 +87,7 @@ except Exception as e:
 # Expose shared DB objects so Blueprints can read them via current_app.config
 app.config['GRIDFS'] = fs
 app.config['FILES_COLLECTION'] = files_collection
+app.config['MONGO_CLIENT'] = client
 
 # Register QA Blueprint
 from qa_routes import qa_bp
@@ -187,7 +188,7 @@ def upload_file():
                     "uploadType": "user",
                     "createdAt": datetime.utcnow(),
                     "updatedAt": datetime.utcnow(),
-                    "Collection": os.path.splitext(os.path.basename(filename))[0].lower().replace(" ", "_"),
+                    "qdrantCollection": filename_to_collection_name(filename),
                     "originalName": filename,
                     "filePath": filepath,
                     "fileType": file.content_type,
@@ -394,11 +395,38 @@ def get_lesson_content(file_id):
 #=================================================
 
 
+# ---- Helper to fetch file or lesson document ----
+def _get_file_context(file_id=None):
+    if not file_id:
+        return files_collection.find_one({}, sort=[("uploadDate", -1)])
+    
+    from bson import ObjectId as ObjId
+    file_doc = None
+    try:
+        file_doc = files_collection.find_one({"_id": ObjId(file_id)})
+    except Exception:
+        pass
+    
+    if not file_doc:
+        file_doc = files_collection.find_one({"file_id": file_id})
+    
+    if not file_doc:
+        file_doc = files_collection.find_one({"originalName": file_id})
+
+    if not file_doc:
+        file_doc = db["lesson_contents"].find_one({"file_id": file_id})
+        # If found in lesson_contents, make sure we return a mock 'originalName' for consistency
+        if file_doc and 'title' in file_doc and 'originalName' not in file_doc:
+             file_doc['originalName'] = file_doc['title']
+    
+    return file_doc
+
 # ---- Fetch the summary of the pdf from MongoDB ----
 @app.route("/api/get_text")
 def get_text():
     """Return the selected uploaded pdf from MongoDB."""
-    file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)]) 
+    file_id = request.args.get('file_id')
+    file_doc = _get_file_context(file_id) 
 
     if not file_doc:
         return jsonify({"script_text": "No content available."})
@@ -431,7 +459,8 @@ def get_text():
 @app.route("/api/get_batches")
 def get_batches():
     """Return explanation batches as an ordered array for progressive display."""
-    file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])
+    file_id = request.args.get('file_id')
+    file_doc = _get_file_context(file_id)
 
     if not file_doc:
         return jsonify({"batches": [], "totalBatches": 0, "fileName": ""})
@@ -465,7 +494,8 @@ def get_batches():
 @app.route("/api/get_links")
 def get_links():
     """Return the latest uploaded links from MongoDB."""
-    file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])
+    file_id = request.args.get('file_id')
+    file_doc = _get_file_context(file_id)
 
     if not file_doc:
         return jsonify({"links": []})
@@ -519,84 +549,22 @@ def get_tts_audio(audio_id):
 
 
 # =============================================================================
-# MMR Assessment Chunk Pool
-# Maintains a per-collection pool of maximally-diverse chunks retrieved from
-# Qdrant via MMR (Max Marginal Relevance).  Chunks are served one at a time;
-# when the pool is exhausted a fresh MMR query re-fills it.
+# Assessment — Full-PDF Context
+# Both generate_question and submit_answer feed the complete PDF text to the
+# LLM so questions and evaluation are grounded in the whole document, not a
+# single randomly-sampled chunk.
 # =============================================================================
 
-_mmr_pool: list = []          # ordered list of chunk texts
-_mmr_used: set = set()        # indices of chunks already served
-_mmr_collection: str = ""     # which collection the pool belongs to
-
-MMR_FETCH_K = 20   # candidate pool Qdrant fetches before MMR re-ranking
-MMR_TOP_K  = 10    # how many diverse chunks to keep in the pool
+# Max characters of PDF text sent to the LLM.
+# ~15 000 chars ≈ 10-12 pages of a typical school textbook.
+ASSESSMENT_MAX_CHARS = 15_000
 
 
-def _build_mmr_pool(collection_name: str) -> list:
+def _extract_pdf_text(pdf_path: str, max_chars: int = ASSESSMENT_MAX_CHARS) -> str:
     """
-    Query Qdrant with MMR to get MMR_TOP_K maximally diverse chunks.
-    Returns a list of plain text strings.
+    Read a PDF and return up to max_chars of plain text.
+    Used as the full context for both question generation and answer evaluation.
     """
-    try:
-        from langchain_qdrant import QdrantVectorStore
-        from langchain_community.embeddings import HuggingFaceBgeEmbeddings
-        from qdrant_client import QdrantClient as _QdrantClient
-
-        local_path = os.getenv("LOCAL_EMBEDDING_MODEL_PATH", "")
-        model_name = local_path if os.path.exists(local_path) else os.getenv("EMBEDDING_MODEL", "")
-        _emb = HuggingFaceBgeEmbeddings(
-            model_name=model_name,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": False}
-        )
-        _cli = _QdrantClient(url=os.getenv("QDRANT_URL"), prefer_grpc=False)
-        vs = QdrantVectorStore(client=_cli, collection_name=collection_name, embedding=_emb)
-
-        # MMR: diverse sample — empty query string retrieves broadly across the collection
-        docs = vs.max_marginal_relevance_search(
-            query="",
-            k=MMR_TOP_K,
-            fetch_k=MMR_FETCH_K,
-            lambda_mult=0.5    # 0=max diversity, 1=max relevance
-        )
-        texts = [d.page_content.replace("\n", " ").strip() for d in docs if len(d.page_content.strip()) > 40]
-        print(f"[MMR POOL] Built pool with {len(texts)} chunks from '{collection_name}'")
-        return texts
-    except Exception as e:
-        print(f"[MMR POOL] Failed to build pool: {e}")
-        return []
-
-
-def _get_next_chunk(collection_name: str) -> str:
-    """
-    Return the next unused chunk from the MMR pool.
-    Automatically re-fills when the pool is exhausted or the collection changes.
-    """
-    global _mmr_pool, _mmr_used, _mmr_collection
-
-    # Re-fill if collection changed or all chunks used up
-    if collection_name != _mmr_collection or len(_mmr_used) >= len(_mmr_pool):
-        _mmr_pool = _build_mmr_pool(collection_name)
-        _mmr_used = set()
-        _mmr_collection = collection_name
-
-    if not _mmr_pool:
-        return ""
-
-    # Pick the next unused chunk (in pool order)
-    for idx, text in enumerate(_mmr_pool):
-        if idx not in _mmr_used:
-            _mmr_used.add(idx)
-            print(f"[MMR POOL] Serving chunk {idx + 1}/{len(_mmr_pool)} from pool")
-            return text
-
-    return ""
-
-
-# ---- Fallback: extract raw text from a PDF for submit context ----
-def _extract_pdf_text(pdf_path: str, max_chars: int = 4000) -> str:
-    """Read a PDF and return up to max_chars of plain text (used for submit context only)."""
     try:
         from langchain_community.document_loaders import PyPDFLoader
         loader = PyPDFLoader(pdf_path)
@@ -604,10 +572,34 @@ def _extract_pdf_text(pdf_path: str, max_chars: int = 4000) -> str:
         full_text = " ".join(d.page_content for d in docs if d.page_content).strip()
         if len(full_text) > max_chars:
             full_text = full_text[:max_chars] + "..."
+        print(f"[ASSESSMENT] Extracted {len(full_text)} chars from PDF: {pdf_path}")
         return full_text
     except Exception as e:
         print(f"[ASSESSMENT] PDF extraction failed: {e}")
         return ""
+
+
+def _get_assessment_context(file_doc: dict) -> str:
+    """
+    Return the best available context text for a given file document.
+    Priority: full PDF text → stored explanation batches (summaries).
+    """
+    pdf_path = file_doc.get("filePath", "")
+    if pdf_path:
+        text = _extract_pdf_text(pdf_path)
+        if text:
+            return text
+
+    # Fallback: concatenate stored explanation summaries
+    batches = file_doc.get("explanationBatches", [])
+    fallback = " ".join(
+        b.get("summary", "") for b in batches
+        if isinstance(b, dict) and b.get("summary")
+    ).strip()
+    if fallback:
+        print("[ASSESSMENT] Using stored summaries as context (PDF not available).")
+    return fallback[:ASSESSMENT_MAX_CHARS]
+
 
 # ----------------- Endpoint to generate question -----------------
 @app.route('/api/assessment/generate', methods=['GET'])
@@ -620,7 +612,7 @@ def generate_question():
         q_type    = request.args.get('type', 'theoretical')
         print(f"[ASSESSMENT] Generating {q_type} question for file: '{file_name}'")
 
-        # Resolve file doc (for collection name + fallback)
+        # Resolve file document
         if file_name:
             file_doc = files_collection.find_one({"originalName": file_name})
         else:
@@ -629,31 +621,14 @@ def generate_question():
         if not file_doc:
             return jsonify({"error": "No file found in database"}), 404
 
-        # Derive the Qdrant collection for this file
-        collection_name = filename_to_collection_name(
-            file_doc.get("originalName", file_name or "default")
-        )
-
-        # Get next diverse chunk from MMR pool
-        chunk_text = _get_next_chunk(collection_name)
-
-        # Fallback: use PDF text or summary if Qdrant is unreachable
-        if not chunk_text:
-            print("[ASSESSMENT] MMR returned nothing — falling back to PDF/summary")
-            pdf_path = file_doc.get("filePath", "")
-            chunk_text = _extract_pdf_text(pdf_path) if pdf_path else ""
-        if not chunk_text:
-            batches = file_doc.get("explanationBatches", [])
-            chunk_text = " ".join(
-                b.get("summary", "") for b in batches
-                if isinstance(b, dict) and b.get("summary")
-            ).strip()[:4000]
-        if not chunk_text:
+        # Get full PDF text as context
+        context_text = _get_assessment_context(file_doc)
+        if not context_text:
             return jsonify({"error": "No content available to generate a question"}), 404
 
         if q_type == 'mcq':
-            template = f"""You are a tutor. Based on the following document excerpt, create ONE multiple-choice question (MCQ)
-that tests the student's understanding of a specific concept in this excerpt.
+            template = f"""You are a tutor. Based on the following document content, create ONE multiple-choice question (MCQ)
+that tests the student's understanding of a specific concept.
 
 STRICT Format:
 Question: [The question text]
@@ -665,13 +640,13 @@ Correct Answer: [Option X]
 Explanation: [Explanation why it is correct]
 Hint: [A helpful hint without giving away the answer]
 
-Document Excerpt: {chunk_text}
+Document Content: {context_text}
 Question:"""
         else:
-            template = f"""You are a tutor. Based on the following document excerpt, create ONE clear and specific question
-that tests the student's understanding of a key concept in this excerpt.
+            template = f"""You are a tutor. Based on the following document content, create ONE clear and specific question
+that tests the student's understanding of a key concept.
 
-Document Excerpt: {chunk_text}
+Document Content: {context_text}
 Question:"""
 
         response = llm(template)
@@ -717,16 +692,8 @@ def submit_answer():
         if not file_doc:
             return jsonify({"error": "No file found in database"}), 404
 
-        # Use full PDF text as context (same source as generate_question)
-        pdf_path = file_doc.get("filePath", "")
-        context_text = _extract_pdf_text(pdf_path) if pdf_path else ""
-
-        if not context_text:
-            batches = file_doc.get("explanationBatches", [])
-            context_text = " ".join(
-                b.get("summary", "") for b in batches
-                if isinstance(b, dict) and b.get("summary")
-            ).strip()[:4000]
+        # Get full PDF text as context (shared helper, same as generate_question)
+        context_text = _get_assessment_context(file_doc)
 
         prompt = f"""You are an AI tutor evaluating a student's answer.
 

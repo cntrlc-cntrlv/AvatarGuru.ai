@@ -1,6 +1,7 @@
 import sys
 import os
 from dotenv import load_dotenv
+from pymongo import MongoClient
 
 # Using the updated libraries from ingest_test.py
 from langchain_community.document_loaders import PyPDFLoader
@@ -118,6 +119,20 @@ def ingest_document(file_path):
             vectorstore.add_documents(lesson1_chunks)
 
         print(f"✅ Ingestion complete! Data stored in collection '{COLLECTION_NAME}'.")
+
+        # ---- Write the confirmed qdrantCollection name back to MongoDB ----
+        try:
+            _mongo_client = MongoClient(os.getenv("MONGODB_URL"))
+            _db = _mongo_client[os.getenv("MONGO_DB")]
+            _files_col = _db["files"]
+            _original_name = os.path.basename(file_path)
+            _files_col.update_one(
+                {"originalName": _original_name},
+                {"$set": {"qdrantCollection": COLLECTION_NAME}}
+            )
+            print(f"✅ MongoDB updated: qdrantCollection='{COLLECTION_NAME}' for '{_original_name}'")
+        except Exception as db_err:
+            print(f"⚠️ Could not update MongoDB with qdrantCollection: {db_err}")
 
     except Exception as e:
         print(f"❌ Error during ingestion: {e}")

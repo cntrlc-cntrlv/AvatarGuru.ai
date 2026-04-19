@@ -152,12 +152,13 @@ class ApiService {
   }
 
   // Get text content
-  async getText(): Promise<{
+  async getText(fileId?: string): Promise<{
     text: string;
     images: string[];
     fileName?: string;
   }> {
-    const response = await fetch(`${this.baseURL}/api/get_text`);
+    const url = fileId ? `${this.baseURL}/api/get_text?file_id=${encodeURIComponent(fileId)}` : `${this.baseURL}/api/get_text`;
+    const response = await fetch(url);
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
@@ -173,8 +174,9 @@ class ApiService {
   }
 
   // Get explanation batches for progressive display
-  async getBatches(): Promise<BatchesResponse> {
-    const response = await fetch(`${this.baseURL}/api/get_batches`);
+  async getBatches(fileId?: string): Promise<BatchesResponse> {
+    const url = fileId ? `${this.baseURL}/api/get_batches?file_id=${encodeURIComponent(fileId)}` : `${this.baseURL}/api/get_batches`;
+    const response = await fetch(url);
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
@@ -185,8 +187,9 @@ class ApiService {
   }
 
   // Get reference links
-  async getLinks(): Promise<ReferenceLink[]> {
-    const response = await fetch(`${this.baseURL}/api/get_links`);
+  async getLinks(fileId?: string): Promise<ReferenceLink[]> {
+    const url = fileId ? `${this.baseURL}/api/get_links?file_id=${encodeURIComponent(fileId)}` : `${this.baseURL}/api/get_links`;
+    const response = await fetch(url);
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
