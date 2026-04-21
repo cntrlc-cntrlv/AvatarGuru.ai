@@ -123,16 +123,31 @@ def groq_tts(text, voice=None, model=None, response_format="wav"):
     return audio_data
 
 
-# -----------------------------------------------------------------------------
-# Parler TTS Setup (Local Model)
-# -----------------------------------------------------------------------------
-PARLER_TTS_MODEL_PATH = r"C:\ai4bharat\tts\models\parler_tts_mini_v1"
+# =============================================================================
+# Parler TTS Setup (Local Model — parler-tts/parler-tts-mini-v1)
+# =============================================================================
+PARLER_TTS_MODEL_PATH = os.getenv("TTS_MODEL", "parler-tts/parler-tts-mini-v1")
 
-_tts_model = None
+# Voice description used for all TTS generation
+TTS_VOICE_DESCRIPTION = (
+    "A calm Indian teacher voice, clear pronunciation, warm tone, "
+    "moderate speed, natural narration."
+)
+
+# Target / max token counts per TTS chunk (increase safety margins for RTX 3050 4GB)
+TTS_CHUNK_TARGET_TOKENS = 120   # aim for this size
+TTS_CHUNK_MAX_TOKENS    = 180   # hard ceiling
+
+_tts_model     = None
 _tts_tokenizer = None
 
+
 def load_parler_tts():
-    """Lazy-load the Parler TTS model and tokenizer (once)."""
+    """
+    Lazy-load the Parler TTS model and tokenizer once.
+    - Uses fp16 on CUDA to reduce VRAM usage on RTX 3050 4GB.
+    - Falls back to CPU (fp32) automatically.
+    """
     global _tts_model, _tts_tokenizer
     if _tts_model is not None:
         return _tts_model, _tts_tokenizer
@@ -143,51 +158,253 @@ def load_parler_tts():
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-    _tts_model = ParlerTTSForConditionalGeneration.from_pretrained(
-        PARLER_TTS_MODEL_PATH
-    ).to(device)
+    # --- [CHANGED] Load in fp16 on CUDA for reduced VRAM consumption ---
+    if device == "cuda:0":
+        _tts_model = ParlerTTSForConditionalGeneration.from_pretrained(
+            PARLER_TTS_MODEL_PATH,
+            torch_dtype=torch.float16,
+        ).to(device)
+    else:
+        _tts_model = ParlerTTSForConditionalGeneration.from_pretrained(
+            PARLER_TTS_MODEL_PATH,
+        ).to(device)
+
     _tts_tokenizer = AutoTokenizer.from_pretrained(PARLER_TTS_MODEL_PATH)
 
-    print(f"✅ Parler TTS loaded on {device}")
+    print(f"✅ Parler TTS loaded on {device} ({'fp16' if device == 'cuda:0' else 'fp32'})")
     return _tts_model, _tts_tokenizer
 
-def generate_audio_for_text(text, max_chars=2000):
+
+# =============================================================================
+# [NEW] Sentence-Aware Text Chunking for TTS
+# =============================================================================
+import re
+import numpy as np
+
+def _split_into_sentences(text: str) -> list:
+    """
+    Split text into sentences using punctuation boundaries.
+    Handles periods, exclamation marks, and question marks reliably.
+    """
+    # Normalise whitespace first
+    text = re.sub(r'\s+', ' ', text.strip())
+    # Split on sentence-ending punctuation followed by whitespace or end-of-string
+    raw = re.split(r'(?<=[.!?])\s+', text)
+    # Filter out empty strings
+    return [s.strip() for s in raw if s.strip()]
+
+
+def split_text_into_tts_chunks(text: str, tokenizer) -> list:
+    """
+    [NEW] Split `text` into sentence-aware chunks suitable for Parler TTS.
+
+    Rules:
+      - Target chunk size : TTS_CHUNK_TARGET_TOKENS (120)
+      - Hard ceiling      : TTS_CHUNK_MAX_TOKENS    (180)
+      - Never cut a sentence mid-way unless it alone exceeds the ceiling.
+      - Returns a list of plain-text chunk strings.
+    """
+    sentences = _split_into_sentences(text)
+    chunks = []
+    current_chunk_sentences = []
+    current_token_count = 0
+
+    for sentence in sentences:
+        # Count tokens for this sentence
+        sentence_tokens = len(tokenizer.encode(sentence, add_special_tokens=False))
+
+        # If a single sentence exceeds the hard ceiling, split it by word-boundary
+        if sentence_tokens > TTS_CHUNK_MAX_TOKENS:
+            # Flush any accumulated chunk first
+            if current_chunk_sentences:
+                chunks.append(' '.join(current_chunk_sentences))
+                current_chunk_sentences = []
+                current_token_count = 0
+
+            # Break the long sentence at the token boundary
+            words = sentence.split()
+            sub_chunk_words = []
+            sub_tokens = 0
+            for word in words:
+                word_tokens = len(tokenizer.encode(word, add_special_tokens=False))
+                if sub_tokens + word_tokens > TTS_CHUNK_MAX_TOKENS and sub_chunk_words:
+                    chunks.append(' '.join(sub_chunk_words))
+                    sub_chunk_words = [word]
+                    sub_tokens = word_tokens
+                else:
+                    sub_chunk_words.append(word)
+                    sub_tokens += word_tokens
+            if sub_chunk_words:
+                chunks.append(' '.join(sub_chunk_words))
+            continue
+
+        # Adding this sentence would exceed the target → flush and start new chunk
+        if current_token_count + sentence_tokens > TTS_CHUNK_TARGET_TOKENS and current_chunk_sentences:
+            # Only flush early if adding this sentence pushes past the hard ceiling
+            if current_token_count + sentence_tokens > TTS_CHUNK_MAX_TOKENS:
+                chunks.append(' '.join(current_chunk_sentences))
+                current_chunk_sentences = [sentence]
+                current_token_count = sentence_tokens
+            else:
+                # Still within max — keep accumulating for a fuller chunk
+                current_chunk_sentences.append(sentence)
+                current_token_count += sentence_tokens
+        else:
+            current_chunk_sentences.append(sentence)
+            current_token_count += sentence_tokens
+
+    # Flush any remaining sentences
+    if current_chunk_sentences:
+        chunks.append(' '.join(current_chunk_sentences))
+
+    return chunks
+
+
+# =============================================================================
+# [NEW] Single-Chunk Audio Generator (with retry)
+# =============================================================================
+def _generate_chunk_audio(chunk_text: str, model, tokenizer, device: str):
+    """
+    [NEW] Generate audio for a single text chunk using Parler TTS.
+    Returns (numpy_array, sample_rate) or raises an exception.
+    Memory is explicitly freed after generation.
+    """
+    desc_inputs  = tokenizer(TTS_VOICE_DESCRIPTION, return_tensors="pt").to(device)
+    text_inputs  = tokenizer(chunk_text,            return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        generation = model.generate(
+            input_ids=desc_inputs.input_ids,
+            attention_mask=desc_inputs.attention_mask,
+            prompt_input_ids=text_inputs.input_ids,
+            prompt_attention_mask=text_inputs.attention_mask,
+        )
+
+    audio_arr   = generation.cpu().numpy().squeeze()
+    sample_rate = model.config.sampling_rate
+
+    # --- [CHANGED] GPU memory safety: free tensors immediately ---
+    del generation, desc_inputs, text_inputs
+    if device == "cuda:0":
+        torch.cuda.empty_cache()
+
+    return audio_arr, sample_rate
+
+
+# =============================================================================
+# [CHANGED] generate_audio_for_text — now uses chunked pipeline
+# =============================================================================
+def generate_audio_for_text(text: str, temp_chunk_dir: str = None):
     """
     Generate a WAV audio byte stream from text using Parler TTS.
-    Returns (wav_bytes, sample_rate) or (None, None) on failure.
+
+    [CHANGED] Instead of feeding the entire text at once, this function:
+      1. Cleans the text.
+      2. Splits it into sentence-aware chunks (100-150 tokens, max 180).
+      3. Generates audio per chunk (with retry + resume support).
+      4. Clears GPU cache after each chunk.
+      5. Merges all chunk arrays in order.
+      6. Returns (wav_bytes, sample_rate) or (None, None) on failure.
+
+    Args:
+        text           : Input text to convert to speech.
+        temp_chunk_dir : Optional directory to save chunk WAV files for resume
+                         support.  Pass a batch-specific path like
+                         "outputs/batch1/" to enable caching.  If None,
+                         chunking still happens in memory only.
     """
     try:
         model, tokenizer = load_parler_tts()
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-        description = (
-            "A female speaker delivers a clear, calm, and engaging lecture "
-            "in a neutral academic tone."
-        )
+        # --- Step 1: Clean text ---
+        clean = re.sub(r'\s+', ' ', text.strip())
+        if not clean:
+            print("⚠️ generate_audio_for_text received empty text — skipping.")
+            return None, None
 
-        if len(text) > max_chars:
-            text = text[:max_chars]
+        # --- Step 2: Split into sentence-aware chunks ---
+        chunks = split_text_into_tts_chunks(clean, tokenizer)
+        total_chunks = len(chunks)
+        print(f"🔊 TTS: split into {total_chunks} chunk(s) for generation.")
 
-        desc_inputs = tokenizer(description, return_tensors="pt").to(device)
-        text_inputs = tokenizer(text, return_tensors="pt").to(device)
+        # --- Optional chunk directory for resume support ---
+        if temp_chunk_dir:
+            os.makedirs(temp_chunk_dir, exist_ok=True)
 
-        with torch.no_grad():
-            generation = model.generate(
-                input_ids=desc_inputs.input_ids,
-                attention_mask=desc_inputs.attention_mask,
-                prompt_input_ids=text_inputs.input_ids,
-                prompt_attention_mask=text_inputs.attention_mask,
-            )
+        # --- Step 3 + 4: Generate audio per chunk with retry + resume ---
+        chunk_arrays = []
+        final_sample_rate = None
 
-        audio_arr = generation.cpu().numpy().squeeze()
-        sample_rate = model.config.sampling_rate
+        for idx, chunk_text in enumerate(chunks, start=1):
+            chunk_label = f"chunk_{idx:03d}"
+            chunk_file  = os.path.join(temp_chunk_dir, f"{chunk_label}.wav") if temp_chunk_dir else None
 
+            print(f"   Generating chunk {idx}/{total_chunks}...")
+
+            # --- Resume: skip if chunk file already exists ---
+            if chunk_file and os.path.exists(chunk_file):
+                print(f"   ↩️  {chunk_label} already exists — reusing cached file.")
+                cached_rate, cached_arr = scipy.io.wavfile.read(chunk_file)
+                chunk_arrays.append(cached_arr.astype(np.float32))
+                if final_sample_rate is None:
+                    final_sample_rate = cached_rate
+                continue
+
+            # --- Retry logic: try once, retry once on failure ---
+            audio_arr = None
+            for attempt in range(1, 3):  # attempt 1 and 2
+                try:
+                    audio_arr, sr = _generate_chunk_audio(chunk_text, model, tokenizer, device)
+                    if final_sample_rate is None:
+                        final_sample_rate = sr
+                    break
+                except Exception as chunk_err:
+                    print(f"   ⚠️  Chunk {idx} attempt {attempt} failed: {chunk_err}")
+                    if device == "cuda:0":
+                        torch.cuda.empty_cache()
+                    if attempt == 2:
+                        print(f"   ❌ Chunk {idx} failed after 2 attempts — skipping.")
+
+            if audio_arr is None:
+                continue  # log and continue with remaining chunks
+
+            # --- Save chunk file if requested ---
+            if chunk_file:
+                try:
+                    buf_c = io.BytesIO()
+                    scipy.io.wavfile.write(buf_c, rate=final_sample_rate, data=audio_arr)
+                    with open(chunk_file, 'wb') as cf:
+                        cf.write(buf_c.getvalue())
+                except Exception as save_err:
+                    print(f"   ⚠️  Could not save chunk file: {save_err}")
+
+            chunk_arrays.append(audio_arr.astype(np.float32))
+
+        if not chunk_arrays:
+            print("❌ No audio chunks were successfully generated.")
+            return None, None
+
+        # --- Step 5: Merge all chunk arrays in order ---
+        # Ensure all arrays are 1-D before concatenation
+        flat_arrays = [arr.flatten() for arr in chunk_arrays]
+        merged_audio = np.concatenate(flat_arrays).astype(np.float32)
+
+        # Normalise to [-1, 1] to avoid clipping artefacts at join points
+        peak = np.max(np.abs(merged_audio))
+        if peak > 0:
+            merged_audio = merged_audio / peak
+
+        # --- Step 6: Encode to WAV bytes ---
         buf = io.BytesIO()
-        scipy.io.wavfile.write(buf, rate=sample_rate, data=audio_arr)
+        scipy.io.wavfile.write(buf, rate=final_sample_rate, data=merged_audio)
         wav_bytes = buf.getvalue()
 
-        print(f"🔊 Generated {len(wav_bytes)} bytes of audio ({len(text)} chars)")
-        return wav_bytes, sample_rate
+        print(
+            f"🔊 Merged {len(chunk_arrays)} chunk(s) → "
+            f"{len(wav_bytes):,} bytes of audio ({len(clean)} chars)"
+        )
+        return wav_bytes, final_sample_rate
 
     except Exception as e:
         print(f"❌ Parler TTS generation failed: {e}")
@@ -373,13 +590,24 @@ def process_batch_pipeline(chunks, fs, pdf_basename: str, batch_size: int = 10) 
             print(f"⚠️ Image generation failed for batch {batch_number}: {e}")
             batch_images = []
 
-        # --- Step 4: TTS Audio ---
+        # --- Step 4: TTS Audio (chunked pipeline) ---
+        # [CHANGED] generate_audio_for_text now splits text into sentence-aware
+        # chunks internally.  We pass a batch-specific temp_chunk_dir so that
+        # individual chunk WAVs are persisted for resume support.
         audio_meta = None
         try:
-            wav_bytes, sample_rate = generate_audio_for_text(merged_summary)
+            safe_name = secure_filename(os.path.splitext(pdf_basename)[0]) or "batch"
+            audio_filename = f"{safe_name}_batch{batch_number}.wav"
+
+            # Build the chunk cache directory: outputs/<safe_name>_batch<N>/
+            chunk_dir = os.path.join("outputs", f"{safe_name}_batch{batch_number}")
+
+            print(f"🎙️ Generating audio for batch {batch_number} (chunked pipeline)...")
+            wav_bytes, sample_rate = generate_audio_for_text(
+                merged_summary,
+                temp_chunk_dir=chunk_dir,
+            )
             if wav_bytes:
-                safe_name = secure_filename(os.path.splitext(pdf_basename)[0]) or "batch"
-                audio_filename = f"{safe_name}_batch{batch_number}.wav"
                 gridfs_id = store_audio_in_gridfs(fs, wav_bytes, audio_filename, sample_rate)
                 if gridfs_id:
                     audio_meta = build_audio_meta(gridfs_id, audio_filename)
@@ -439,3 +667,48 @@ def load_and_chunk_pdf(pdf_path: str, start_page: int = None, end_page: int = No
         for idx, chunk in enumerate(chunks):
             chunk.metadata["chunk_index"] = idx
         return chunks
+
+
+# -----------------------------------------------------------------------------
+# Ingest into Qdrant Vector Database  (shared utility)
+# -----------------------------------------------------------------------------
+def ingest_into_qdrant(chunks: list, collection_name: str) -> None:
+    """
+    Embed and store document chunks in a Qdrant collection.
+    Creates the collection if it does not exist; appends otherwise.
+
+    Args:
+        chunks:          List of LangChain Document objects to ingest.
+        collection_name: Target Qdrant collection name.
+    """
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_qdrant import QdrantVectorStore
+    from qdrant_client import QdrantClient
+
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
+    QDRANT_URL = os.getenv("QDRANT_URL")
+
+    print(f"📥 Ingesting {len(chunks)} chunks into Qdrant collection: '{collection_name}'")
+
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    client = QdrantClient(url=QDRANT_URL)
+    existing_collections = [c.name for c in client.get_collections().collections]
+
+    if collection_name not in existing_collections:
+        print(f"⚙️ Creating new collection '{collection_name}'...")
+        QdrantVectorStore.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            url=QDRANT_URL,
+            collection_name=collection_name,
+        )
+    else:
+        print(f"📦 Collection '{collection_name}' exists. Adding documents...")
+        vectorstore = QdrantVectorStore(
+            client=client,
+            collection_name=collection_name,
+            embedding=embeddings,
+        )
+        vectorstore.add_documents(chunks)
+
+    print(f"✅ Qdrant ingestion complete for '{collection_name}'.")

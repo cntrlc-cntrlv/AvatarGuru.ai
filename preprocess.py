@@ -42,9 +42,6 @@ from groq import Groq
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.output_parsers import StructuredOutputParser, ResponseSchema
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
 
 from common_fn import (
     groq_generate,
@@ -55,6 +52,7 @@ from common_fn import (
     load_and_chunk_pdf,
     process_batch_pipeline,
     build_audio_meta,
+    ingest_into_qdrant,
 )
 
 # Force override so updated .env values are used
@@ -142,36 +140,7 @@ format_instructions = output_parser.get_format_instructions()
 # =====================================================================================================
 # Ingest into Qdrant Vector Database
 # =====================================================================================================
-def ingest_into_qdrant(chunks, collection_name):
-    """Embed and store chunks in Qdrant for retrieval."""
-    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
-    QDRANT_URL = os.getenv("QDRANT_URL")
-
-    print(f"📥 Ingesting {len(chunks)} chunks into Qdrant collection: '{collection_name}'")
-
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-
-    qdrant_client = QdrantClient(url=QDRANT_URL)
-    existing_collections = [c.name for c in qdrant_client.get_collections().collections]
-
-    if collection_name not in existing_collections:
-        print(f"⚙️ Creating new collection '{collection_name}'...")
-        QdrantVectorStore.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            url=QDRANT_URL,
-            collection_name=collection_name
-        )
-    else:
-        print(f"📦 Collection '{collection_name}' exists. Adding documents...")
-        vectorstore = QdrantVectorStore(
-            client=qdrant_client,
-            collection_name=collection_name,
-            embedding=embeddings
-        )
-        vectorstore.add_documents(chunks)
-
-    print(f"✅ Qdrant ingestion complete for '{collection_name}'.")
+# ingest_into_qdrant is imported from common_fn and called directly in the main pipeline.
 
 
 

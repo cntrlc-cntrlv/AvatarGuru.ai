@@ -24,3 +24,7 @@ ratelimit
 requests
 Pillow
 librosa
+# --- TTS chunked pipeline dependencies ---
+parler-tts
+numpy
+scipy

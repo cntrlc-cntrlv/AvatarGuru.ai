@@ -56,11 +56,14 @@ CORS(app)
 # ---------------- Configuration for Uploads & Collection folders ----------------
 # -----------------------------------------------------------------------
 
+#Generate the Upload Directory
 UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER")
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
+
+#Generate the TTS Directory
 TTS_OUTPUT_FOLDER = os.getenv("TTS_OUTPUT_FOLDER")
 if not os.path.exists(TTS_OUTPUT_FOLDER):
     os.makedirs(TTS_OUTPUT_FOLDER)
@@ -250,24 +253,6 @@ def check_processing_status(filename):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-
-# ====================================================
-# ------------------- Q&A Page -----------------------
-# ====================================================
-
-# ---- Returns a list of all files in the directory ----
-@app.route('/api/files', methods=['GET'])
-def get_files():
-    if not client:
-        return jsonify({"error": "Database connection is not available."}), 500
-    try:
-        # Find all documents and only return the originalName field, sorted by date
-        files = list(files_collection.find({}, {"_id": 0, "originalName": 1}).sort("uploadDate", -1))
-        file_names = [f['originalName'] for f in files]
-        return jsonify(file_names)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 
 # =============================================
@@ -541,6 +526,27 @@ def get_tts_audio(audio_id):
     except Exception as e:
         print("[TTS-AUDIO ERROR]", e)
         return jsonify({"error": "Audio not found"}), 404
+
+
+
+
+# ====================================================
+# ------------------- Q&A Page -----------------------
+# ====================================================
+
+# ---- Returns a list of all files in the directory ----
+@app.route('/api/files', methods=['GET'])
+def get_files():
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+    try:
+        # Find all documents and only return the originalName field, sorted by date
+        files = list(files_collection.find({}, {"_id": 0, "originalName": 1}).sort("uploadDate", -1))
+        file_names = [f['originalName'] for f in files]
+        return jsonify(file_names)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 
 # =============================================================
