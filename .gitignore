@@ -6,7 +6,7 @@ __pycache__/
 
 # Virtual environment
 venv/
-env/
+
 .venv/
 
 # Project-specific exclusions
@@ -24,7 +24,6 @@ original files/
 .DS_Store
 
 # Environment variables
-.env
 
 # IDE
 .vscode/
