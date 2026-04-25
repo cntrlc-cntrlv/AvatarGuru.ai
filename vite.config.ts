@@ -6,6 +6,10 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Target for API proxy: uses BACKEND_URL when running inside Docker,
+// falls back to localhost:5000 for plain local dev.
+const backendUrl = process.env.BACKEND_URL ?? "http://localhost:6000";
+
 // https://vitejs.dev/config/
 export default defineConfig({
   server: {
@@ -14,6 +18,18 @@ export default defineConfig({
     fs: {
       allow: ["./client", "./shared", "./"],
       deny: [".env", ".env.*", "*.{crt,pem}", "**/.git/**"],
+    },
+    proxy: {
+      // Forward all /api/* requests to the Flask backend
+      "/api": {
+        target: backendUrl,
+        changeOrigin: true,
+      },
+      // Forward /collections/* (TTS audio served by Flask)
+      "/collections": {
+        target: backendUrl,
+        changeOrigin: true,
+      },
     },
   },
   build: {

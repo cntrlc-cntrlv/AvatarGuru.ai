@@ -1,0 +1,173 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════
+#  AvatarGuru.ai — Docker Compose Stack
+#
+#  Services:
+#    frontend   → Vite dev server (npm run dev)   port 8090
+#    backend    → Flask (python server.py)        port 6000
+#    mongodb    → MongoDB 7                       port 27017
+#    qdrant     → Qdrant vector database          port 6333
+#    translate  → LibreTranslate                  port 5000
+# ══════════════════════════════════════════════════════════
+
+services:
+
+  # ── MongoDB ───────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: avatarguru_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-neurolearn}
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - avatarguru_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ── Qdrant Vector Database ────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.12.1
+    container_name: avatarguru_qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+      - "6334:6334"   # gRPC port
+    networks:
+      - avatarguru_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ── LibreTranslate (Translation API) ─────────────────
+  translate:
+    image: libretranslate/libretranslate:latest
+    container_name: avatarguru_translate
+    restart: unless-stopped
+    environment:
+      # Disable API key requirement for internal use
+      LT_DISABLE_WEB_UI: "false"
+      LT_LOAD_ONLY: "en,hi"   # load only English↔Hindi to save memory; add more as needed
+    ports:
+      - "5000:5000"
+    networks:
+      - avatarguru_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/languages"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 90s   # LibreTranslate downloads models on first boot — needs more time
+
+  # ── Flask Backend  (python server.py) ─────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: avatarguru_backend
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      # Flask port (read by server.py via os.getenv("PORT"))
+      PORT: 6000
+      # Override service URLs to use Docker network hostnames
+      MONGODB_URL: mongodb://mongodb:27017
+      QDRANT_URL: http://qdrant:6333
+      # Translate model points to the translate container on the internal network
+      TRANSLATE_MODEL: http://translate:5000/translate
+      UPLOAD_FOLDER: /app/uploads
+      TTS_OUTPUT_FOLDER: /app/tts_collections
+      COLLECTIONS_FOLDER: /app/collections
+      # Model paths inside the container (mounted via volumes below)
+      LOCAL_EMBEDDING_MODEL_PATH: /models/embedding
+      TTS_MODEL: /models/tts
+    volumes:
+      # Persistent runtime data
+      - uploads_data:/app/uploads
+      - tts_data:/app/tts_collections
+      - collections_data:/app/collections
+      - outputs_data:/app/outputs
+      # server.log is written here — also accessible on the host
+      - logs_data:/app/logs
+      # ML model bind-mounts — set host paths in .env.docker
+      - ${EMBEDDING_MODEL_HOST_PATH:-./models/embedding}:/models/embedding:ro
+      - ${TTS_MODEL_HOST_PATH:-./models/tts}:/models/tts:ro
+    ports:
+      - "6000:6000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      translate:
+        condition: service_healthy
+    networks:
+      - avatarguru_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6000/api/files"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+
+  # ── Vite Frontend  (npm run dev) ──────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: avatarguru_frontend
+    restart: unless-stopped
+    environment:
+      # Vite proxy uses this to forward /api/* to the backend container
+      BACKEND_URL: http://backend:6000
+    ports:
+      # Host 8090 → container 8080 (Vite default port)
+      - "8090:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - avatarguru_net
+
+
+# ══════════════════════════════════════════════════════════
+#  Named Volumes
+# ══════════════════════════════════════════════════════════
+volumes:
+  mongo_data:
+    driver: local
+  qdrant_data:
+    driver: local
+  uploads_data:
+    driver: local
+  tts_data:
+    driver: local
+  collections_data:
+    driver: local
+  outputs_data:
+    driver: local
+  # server.log lives here; read with: docker compose exec backend cat /app/logs/server.log
+  logs_data:
+    driver: local
+
+
+# ══════════════════════════════════════════════════════════
+#  Networks
+# ══════════════════════════════════════════════════════════
+networks:
+  avatarguru_net:
+    driver: bridge

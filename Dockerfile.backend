@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────
+#  AvatarGuru.ai — Backend (Flask + Gunicorn)
+# ─────────────────────────────────────────────
+FROM python:3.11-slim
+
+# System dependencies (audio libs, pdf tools, build tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libsndfile1 \
+    libsndfile1-dev \
+    ffmpeg \
+    libgomp1 \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies first (layer cache optimisation)
+COPY requirement.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirement.txt
+
+# Copy all backend source files
+COPY server.py .
+COPY common_fn.py .
+COPY qa_routes.py .
+COPY retrieval.py .
+COPY ingest1.py .
+COPY summary1.py .
+COPY preprocess.py .
+COPY image_finder.py .
+COPY installation.py .
+
+# Runtime directories (will also be bind-mounted for persistence)
+RUN mkdir -p uploads tts_collections collections outputs logs
+
+# Expose Flask port
+EXPOSE 6000
+
+# -u = unbuffered Python output so logs appear in real-time.
+# tee writes to both stdout (visible in docker logs) and server.log on disk.
+CMD ["sh", "-c", "python -u server.py 2>&1 | tee /app/logs/server.log"]

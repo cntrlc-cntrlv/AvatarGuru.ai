@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────
+#  AvatarGuru.ai — Frontend (Vite Dev Server)
+# ─────────────────────────────────────────────
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dependencies first (layer cache optimisation)
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Copy all frontend source files
+COPY index.html .
+COPY vite.config.ts .
+COPY tsconfig.json .
+COPY tailwind.config.ts .
+COPY postcss.config.js .
+COPY components.json .
+COPY client/ ./client/
+COPY public/ ./public/
+
+# Vite dev server listens on 8080 (set in vite.config.ts)
+EXPOSE 8080
+
+# Run Vite dev server.
+# BACKEND_URL is passed in from docker-compose so the Vite proxy
+# knows where to forward /api/* and /collections/* requests.
+CMD ["npm", "run", "dev"]
