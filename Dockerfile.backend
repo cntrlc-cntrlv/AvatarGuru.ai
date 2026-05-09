@@ -31,6 +31,7 @@ COPY summary1.py .
 COPY preprocess.py .
 COPY image_finder.py .
 COPY installation.py .
+COPY init_models.py .
 
 # Runtime directories (will also be bind-mounted for persistence)
 RUN mkdir -p uploads tts_collections collections outputs logs
@@ -40,4 +41,4 @@ EXPOSE 6000
 
 # -u = unbuffered Python output so logs appear in real-time.
 # tee writes to both stdout (visible in docker logs) and server.log on disk.
-CMD ["sh", "-c", "python -u server.py 2>&1 | tee /app/logs/server.log"]
+CMD ["sh", "-c", "(python -u init_models.py && python -u server.py) 2>&1 | tee /app/logs/server.log"]

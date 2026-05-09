@@ -104,8 +104,8 @@ services:
       # server.log is written here — also accessible on the host
       - logs_data:/app/logs
       # ML model bind-mounts — set host paths in .env.docker
-      - ${EMBEDDING_MODEL_HOST_PATH:-./models/embedding}:/models/embedding:ro
-      - ${TTS_MODEL_HOST_PATH:-./models/tts}:/models/tts:ro
+      - ${EMBEDDING_MODEL_HOST_PATH:-./models/embedding}:/models/embedding
+      - ${TTS_MODEL_HOST_PATH:-./models/tts}:/models/tts
     ports:
       - "6000:6000"
     depends_on:
