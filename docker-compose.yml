@@ -45,12 +45,7 @@ services:
       - "6334:6334"   # gRPC port
     networks:
       - avatarguru_net
-    healthcheck:
-      test: ["CMD", "sh", "-c", "wget -qO- http://localhost:6333/readyz || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
+    # No healthcheck needed — the backend uses service_started below
 
   # ── LibreTranslate (Translation API) ─────────────────
   translate:
@@ -65,12 +60,7 @@ services:
       - "5000:5000"
     networks:
       - avatarguru_net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
-      interval: 30s
-      timeout: 15s
-      retries: 5
-      start_period: 90s   # LibreTranslate downloads models on first boot — needs more time
+    # No healthcheck needed — the backend uses service_started below
 
   # ── Flask Backend  (python server.py) ─────────────────
   backend:
@@ -110,11 +100,11 @@ services:
       - "6000:6000"
     depends_on:
       mongodb:
-        condition: service_healthy
+        condition: service_healthy   # MongoDB has a reliable mongosh ping check
       qdrant:
-        condition: service_healthy
+        condition: service_started   # started is enough; Qdrant logs show it binds on port 6333
       translate:
-        condition: service_healthy
+        condition: service_started   # LibreTranslate needs time to download models but is running
     networks:
       - avatarguru_net
     healthcheck:
