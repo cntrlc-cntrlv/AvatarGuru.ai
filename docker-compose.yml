@@ -107,12 +107,8 @@ services:
         condition: service_started   # LibreTranslate needs time to download models but is running
     networks:
       - avatarguru_net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6000/api/files"]
-      interval: 30s
-      timeout: 15s
-      retries: 5
-      start_period: 60s
+    # No healthcheck — model downloads (init_models.py) depend on internet speed;
+    # the container is considered ready once it starts.
 
   # ── Vite Frontend  (npm run dev) ──────────────────────
   frontend:
@@ -129,7 +125,7 @@ services:
       - "8090:8080"
     depends_on:
       backend:
-        condition: service_healthy
+        condition: service_started
     networks:
       - avatarguru_net
 
