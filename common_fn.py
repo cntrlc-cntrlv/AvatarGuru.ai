@@ -60,7 +60,7 @@ def execute_with_retry(func, *args, **kwargs):
             print(f"Attempt {attempt + 1} failed with key index {_current_key_index}: {e}")
             last_exception = e
             rotate_key()
-    raise last_exception
+    raise last_exception or RuntimeError("All GROQ API key attempts failed with no exception recorded.")
 
 
 def groq_generate(prompt, max_tokens=1200, is_json=False, temperature=0.4, model=None):
