@@ -1,13 +1,9 @@
 import os
 import shutil
-from transformers import AutoTokenizer
-from parler_tts import ParlerTTSForConditionalGeneration
 from huggingface_hub import snapshot_download
 
-TTS_MODEL_NAME = "parler-tts/parler-tts-mini-v1"
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5")
 
-TTS_DIR = "/models/tts"
 EMBED_DIR = "/models/embedding"
 CACHE_DIR = "/tmp/hf_cache"
 
@@ -24,19 +20,6 @@ def is_empty(dir_path):
 print("══════════════════════════════════════════════")
 print("  AvatarGuru.ai — Checking ML Models")
 print("══════════════════════════════════════════════")
-
-if is_empty(TTS_DIR):
-    print(f"Downloading TTS model '{TTS_MODEL_NAME}'...")
-    os.makedirs(TTS_DIR, exist_ok=True)
-    model = ParlerTTSForConditionalGeneration.from_pretrained(TTS_MODEL_NAME, cache_dir=CACHE_DIR)
-    tokenizer = AutoTokenizer.from_pretrained(TTS_MODEL_NAME, cache_dir=CACHE_DIR)
-    
-    print(f"Saving TTS model to {TTS_DIR}...")
-    model.save_pretrained(TTS_DIR)
-    tokenizer.save_pretrained(TTS_DIR)
-    print("✅ TTS model setup complete.")
-else:
-    print(f"✅ TTS model already exists in {TTS_DIR}.")
 
 if is_empty(EMBED_DIR):
     print(f"Downloading Embedding model '{EMBEDDING_MODEL_NAME}'...")

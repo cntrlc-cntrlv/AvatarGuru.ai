@@ -4,8 +4,6 @@ import traceback
 from datetime import datetime
 from dotenv import load_dotenv
 
-import torch
-import scipy.io.wavfile
 from groq import Groq
 from langchain.output_parsers import StructuredOutputParser, ResponseSchema
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -124,59 +122,17 @@ def groq_tts(text, voice=None, model=None, response_format="wav"):
 
 
 # =============================================================================
-# Parler TTS Setup (Local Model — parler-tts/parler-tts-mini-v1)
+# TTS Chunking Configuration
 # =============================================================================
-PARLER_TTS_MODEL_PATH = os.getenv("TTS_MODEL", "parler-tts/parler-tts-mini-v1")
 
-# Voice description used for all TTS generation
-TTS_VOICE_DESCRIPTION = (
-    "A calm Indian teacher voice, clear pronunciation, warm tone, "
-    "moderate speed, natural narration."
-)
-
-# Target / max token counts per TTS chunk (increase safety margins for RTX 3050 4GB)
-TTS_CHUNK_TARGET_TOKENS = 120   # aim for this size
-TTS_CHUNK_MAX_TOKENS    = 180   # hard ceiling
-
-_tts_model     = None
-_tts_tokenizer = None
-
-
-def load_parler_tts():
-    """
-    Lazy-load the Parler TTS model and tokenizer once.
-    - Uses fp16 on CUDA to reduce VRAM usage on RTX 3050 4GB.
-    - Falls back to CPU (fp32) automatically.
-    """
-    global _tts_model, _tts_tokenizer
-    if _tts_model is not None:
-        return _tts_model, _tts_tokenizer
-
-    print(f"🔊 Loading Parler TTS model from: {PARLER_TTS_MODEL_PATH}")
-    from parler_tts import ParlerTTSForConditionalGeneration
-    from transformers import AutoTokenizer
-
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-    # --- [CHANGED] Load in fp16 on CUDA for reduced VRAM consumption ---
-    if device == "cuda:0":
-        _tts_model = ParlerTTSForConditionalGeneration.from_pretrained(
-            PARLER_TTS_MODEL_PATH,
-            torch_dtype=torch.float16,
-        ).to(device)
-    else:
-        _tts_model = ParlerTTSForConditionalGeneration.from_pretrained(
-            PARLER_TTS_MODEL_PATH,
-        ).to(device)
-
-    _tts_tokenizer = AutoTokenizer.from_pretrained(PARLER_TTS_MODEL_PATH)
-
-    print(f"✅ Parler TTS loaded on {device} ({'fp16' if device == 'cuda:0' else 'fp32'})")
-    return _tts_model, _tts_tokenizer
+# Target / max character counts per TTS chunk
+# (Groq TTS has an input limit; keep chunks well within it)
+TTS_CHUNK_TARGET_TOKENS = 120   # aim for this sentence-token size
+TTS_CHUNK_MAX_TOKENS    = 180   # hard ceiling (sentence-token count)
 
 
 # =============================================================================
-# [NEW] Sentence-Aware Text Chunking for TTS
+# Sentence-Aware Text Chunking for TTS
 # =============================================================================
 import re
 import numpy as np
@@ -194,116 +150,23 @@ def _split_into_sentences(text: str) -> list:
     return [s.strip() for s in raw if s.strip()]
 
 
-def split_text_into_tts_chunks(text: str, tokenizer) -> list:
-    """
-    [NEW] Split `text` into sentence-aware chunks suitable for Parler TTS.
-
-    Rules:
-      - Target chunk size : TTS_CHUNK_TARGET_TOKENS (120)
-      - Hard ceiling      : TTS_CHUNK_MAX_TOKENS    (180)
-      - Never cut a sentence mid-way unless it alone exceeds the ceiling.
-      - Returns a list of plain-text chunk strings.
-    """
-    sentences = _split_into_sentences(text)
-    chunks = []
-    current_chunk_sentences = []
-    current_token_count = 0
-
-    for sentence in sentences:
-        # Count tokens for this sentence
-        sentence_tokens = len(tokenizer.encode(sentence, add_special_tokens=False))
-
-        # If a single sentence exceeds the hard ceiling, split it by word-boundary
-        if sentence_tokens > TTS_CHUNK_MAX_TOKENS:
-            # Flush any accumulated chunk first
-            if current_chunk_sentences:
-                chunks.append(' '.join(current_chunk_sentences))
-                current_chunk_sentences = []
-                current_token_count = 0
-
-            # Break the long sentence at the token boundary
-            words = sentence.split()
-            sub_chunk_words = []
-            sub_tokens = 0
-            for word in words:
-                word_tokens = len(tokenizer.encode(word, add_special_tokens=False))
-                if sub_tokens + word_tokens > TTS_CHUNK_MAX_TOKENS and sub_chunk_words:
-                    chunks.append(' '.join(sub_chunk_words))
-                    sub_chunk_words = [word]
-                    sub_tokens = word_tokens
-                else:
-                    sub_chunk_words.append(word)
-                    sub_tokens += word_tokens
-            if sub_chunk_words:
-                chunks.append(' '.join(sub_chunk_words))
-            continue
-
-        # Adding this sentence would exceed the target → flush and start new chunk
-        if current_token_count + sentence_tokens > TTS_CHUNK_TARGET_TOKENS and current_chunk_sentences:
-            # Only flush early if adding this sentence pushes past the hard ceiling
-            if current_token_count + sentence_tokens > TTS_CHUNK_MAX_TOKENS:
-                chunks.append(' '.join(current_chunk_sentences))
-                current_chunk_sentences = [sentence]
-                current_token_count = sentence_tokens
-            else:
-                # Still within max — keep accumulating for a fuller chunk
-                current_chunk_sentences.append(sentence)
-                current_token_count += sentence_tokens
-        else:
-            current_chunk_sentences.append(sentence)
-            current_token_count += sentence_tokens
-
-    # Flush any remaining sentences
-    if current_chunk_sentences:
-        chunks.append(' '.join(current_chunk_sentences))
-
-    return chunks
-
 
 # =============================================================================
-# [NEW] Single-Chunk Audio Generator (with retry)
+# generate_audio_for_text — chunked pipeline using Groq TTS
 # =============================================================================
-def _generate_chunk_audio(chunk_text: str, model, tokenizer, device: str):
-    """
-    [NEW] Generate audio for a single text chunk using Parler TTS.
-    Returns (numpy_array, sample_rate) or raises an exception.
-    Memory is explicitly freed after generation.
-    """
-    desc_inputs  = tokenizer(TTS_VOICE_DESCRIPTION, return_tensors="pt").to(device)
-    text_inputs  = tokenizer(chunk_text,            return_tensors="pt").to(device)
+import scipy.io.wavfile
 
-    with torch.no_grad():
-        generation = model.generate(
-            input_ids=desc_inputs.input_ids,
-            attention_mask=desc_inputs.attention_mask,
-            prompt_input_ids=text_inputs.input_ids,
-            prompt_attention_mask=text_inputs.attention_mask,
-        )
-
-    audio_arr   = generation.cpu().numpy().squeeze()
-    sample_rate = model.config.sampling_rate
-
-    # --- [CHANGED] GPU memory safety: free tensors immediately ---
-    del generation, desc_inputs, text_inputs
-    if device == "cuda:0":
-        torch.cuda.empty_cache()
-
-    return audio_arr, sample_rate
-
-
-# =============================================================================
-# [CHANGED] generate_audio_for_text — now uses chunked pipeline
-# =============================================================================
 def generate_audio_for_text(text: str, temp_chunk_dir: str = None):
     """
-    Generate a WAV audio byte stream from text using Parler TTS.
+    Generate a WAV audio byte stream from text using the Groq TTS API.
 
-    [CHANGED] Instead of feeding the entire text at once, this function:
+    Steps:
       1. Cleans the text.
-      2. Splits it into sentence-aware chunks (100-150 tokens, max 180).
-      3. Generates audio per chunk (with retry + resume support).
-      4. Clears GPU cache after each chunk.
-      5. Merges all chunk arrays in order.
+      2. Splits it into sentence-aware chunks (target ~120 tokens, max 180).
+         A simple word-count approximation is used (no local tokenizer needed).
+      3. Sends each chunk to groq_tts() and receives WAV bytes.
+      4. Decodes each WAV blob into a numpy array via scipy.
+      5. Concatenates all arrays and re-encodes to a single WAV byte stream.
       6. Returns (wav_bytes, sample_rate) or (None, None) on failure.
 
     Args:
@@ -314,9 +177,6 @@ def generate_audio_for_text(text: str, temp_chunk_dir: str = None):
                          chunking still happens in memory only.
     """
     try:
-        model, tokenizer = load_parler_tts()
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
         # --- Step 1: Clean text ---
         clean = re.sub(r'\s+', ' ', text.strip())
         if not clean:
@@ -324,7 +184,52 @@ def generate_audio_for_text(text: str, temp_chunk_dir: str = None):
             return None, None
 
         # --- Step 2: Split into sentence-aware chunks ---
-        chunks = split_text_into_tts_chunks(clean, tokenizer)
+        # Use a lightweight word-count approximation (~0.75 words per token)
+        # so we don't need a local tokenizer.
+        def _approx_tokens(s):
+            return max(1, len(s.split()))
+
+        sentences = _split_into_sentences(clean)
+        chunks = []
+        current_sentences = []
+        current_count = 0
+
+        for sentence in sentences:
+            s_tokens = _approx_tokens(sentence)
+            if s_tokens > TTS_CHUNK_MAX_TOKENS:
+                # Flush any accumulated chunk first
+                if current_sentences:
+                    chunks.append(' '.join(current_sentences))
+                    current_sentences = []
+                    current_count = 0
+                # Break the long sentence at word boundary
+                words = sentence.split()
+                sub_words = []
+                sub_count = 0
+                for word in words:
+                    wt = _approx_tokens(word)
+                    if sub_count + wt > TTS_CHUNK_MAX_TOKENS and sub_words:
+                        chunks.append(' '.join(sub_words))
+                        sub_words = [word]
+                        sub_count = wt
+                    else:
+                        sub_words.append(word)
+                        sub_count += wt
+                if sub_words:
+                    chunks.append(' '.join(sub_words))
+                continue
+
+            if current_count + s_tokens > TTS_CHUNK_MAX_TOKENS and current_sentences:
+                chunks.append(' '.join(current_sentences))
+                current_sentences = [sentence]
+                current_count = s_tokens
+            else:
+                current_sentences.append(sentence)
+                current_count += s_tokens
+
+        if current_sentences:
+            chunks.append(' '.join(current_sentences))
+
         total_chunks = len(chunks)
         print(f"🔊 TTS: split into {total_chunks} chunk(s) for generation.")
 
@@ -353,16 +258,20 @@ def generate_audio_for_text(text: str, temp_chunk_dir: str = None):
 
             # --- Retry logic: try once, retry once on failure ---
             audio_arr = None
+            sr = None
             for attempt in range(1, 3):  # attempt 1 and 2
                 try:
-                    audio_arr, sr = _generate_chunk_audio(chunk_text, model, tokenizer, device)
+                    wav_chunk = groq_tts(chunk_text, response_format="wav")
+                    if not wav_chunk:
+                        raise ValueError("groq_tts returned empty bytes")
+                    # Decode WAV bytes to numpy array
+                    sr, audio_arr = scipy.io.wavfile.read(io.BytesIO(wav_chunk))
+                    audio_arr = audio_arr.astype(np.float32)
                     if final_sample_rate is None:
                         final_sample_rate = sr
                     break
                 except Exception as chunk_err:
                     print(f"   ⚠️  Chunk {idx} attempt {attempt} failed: {chunk_err}")
-                    if device == "cuda:0":
-                        torch.cuda.empty_cache()
                     if attempt == 2:
                         print(f"   ❌ Chunk {idx} failed after 2 attempts — skipping.")
 
@@ -379,7 +288,7 @@ def generate_audio_for_text(text: str, temp_chunk_dir: str = None):
                 except Exception as save_err:
                     print(f"   ⚠️  Could not save chunk file: {save_err}")
 
-            chunk_arrays.append(audio_arr.astype(np.float32))
+            chunk_arrays.append(audio_arr)
 
         if not chunk_arrays:
             print("❌ No audio chunks were successfully generated.")
@@ -407,7 +316,7 @@ def generate_audio_for_text(text: str, temp_chunk_dir: str = None):
         return wav_bytes, final_sample_rate
 
     except Exception as e:
-        print(f"❌ Parler TTS generation failed: {e}")
+        print(f"❌ Groq TTS generation failed: {e}")
         traceback.print_exc()
         return None, None
 
@@ -518,7 +427,7 @@ def build_audio_meta(gridfs_id, audio_filename: str) -> dict:
         "contentType": "audio/wav",
         "audio_url": f"/api/tts-audio/{gridfs_id}",
         "created_at": datetime.utcnow(),
-        "model": "parler_tts_mini_v1",
+        "model": os.getenv("TTS_MODEL", "groq-tts"),
     }
 
 

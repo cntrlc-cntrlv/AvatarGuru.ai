@@ -2,11 +2,6 @@ flask
 flask-cors
 pymongo
 groq
-torch
-transformers
-accelerate
-safetensors
-sentencepiece
 langchain==0.2.16
 langchain-community==0.2.16
 langchain-core==0.2.38
@@ -14,19 +9,11 @@ langchain-huggingface
 langchain-qdrant
 qdrant-client==1.12.1
 pypdf
-PyPDF2
-sentence-transformers
 huggingface_hub
 python-dotenv
-boto3
 gunicorn
 ratelimit
 requests
-Pillow
-librosa
-# --- TTS chunked pipeline dependencies ---
-parler-tts
 numpy
 scipy
 Werkzeug
-bitsandbytes

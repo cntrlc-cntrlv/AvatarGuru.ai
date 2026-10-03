@@ -5,11 +5,6 @@ FROM python:3.10-slim
 
 # System dependencies (audio libs, pdf tools, build tools)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libsndfile1 \
-    libsndfile1-dev \
-    ffmpeg \
-    libgomp1 \
     curl \
     git \
     && rm -rf /var/lib/apt/lists/*
@@ -30,11 +25,10 @@ COPY ingest1.py .
 COPY summary1.py .
 COPY preprocess.py .
 COPY image_finder.py .
-COPY installation.py .
 COPY init_models.py .
 
 # Runtime directories (will also be bind-mounted for persistence)
-RUN mkdir -p uploads tts_collections collections outputs logs
+RUN mkdir -p uploads collections outputs logs
 
 # Expose Flask port
 EXPOSE 6000
